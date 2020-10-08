@@ -14,8 +14,9 @@ import sys, time
 import argparse
 
 ############################# PARAMETERS #############################
-MAX_EPISODES = 50000
-MAX_STEPS_PER_EP = 1000
+MAX_EPISODES = 5000
+MAX_STEPS_PER_EP = 300
+FINITE_HORIZONE = 20
 TEST_FREQUENCY = 10
 TEST_EPISODES = 25
 SAVE_FREQUENCY = 100
@@ -52,26 +53,30 @@ class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size):
         super(ActorCritic, self).__init__()
         self.action_size = action_size
-        self.layer1 = nn.Linear(state_size, N_HIDDEN)
-        self.layer2 = nn.Linear(N_HIDDEN, N_HIDDEN)
-        self.layer3 = nn.Linear(N_HIDDEN, action_size)
-        self.value = nn.Linear(N_HIDDEN, 1)
-        self.to(device)
+
+        # Network referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
+        self.actor_layer1 = nn.Linear(state_size, N_HIDDEN)
+        self.mu = nn.Linear(N_HIDDEN, action_size)
+        self.var = nn.Linear(N_HIDDEN, action_size)
+
+        self.critic_layer1 = nn.Linear(state_size, N_HIDDEN)
+        self.critic_layer2 = nn.Linear(N_HIDDEN, 1)
 
 
     def forward(self, x):
-        x = F.relu(self.layer1(x))
-        x = F.relu(self.layer2(x))
-        mu = 2 * torch.tanh(self.layer3(x))
-        sigma = F.softplus(self.layer3(x)) + 1E-5
-        n_output = self.action_size
-        distribution = torch.distributions.Normal(mu.view(self.action_size,).data, sigma.view(self.action_size,).data)
-        value = self.value(x)
-        return distribution, value
+        x = F.relu(self.actor_layer1(x))
+        mu = nn.tanh(self.mu(x))
+        var = nn.softplus(self.var(x)) + 1E-5
+        # distribution = torch.distributions.Normal(mu.view(self.action_size,).data, sigma.view(self.action_size,).data)
+
+        out = F.relu(self.critic_layer1(x))
+        value = self.critic_layer2(out)
+
+        return mu, var, value
 
 
-class A2C:
-    def __init__(self, envname):
+class A2Ccontinuous:
+    def __init__(self, envname, LR):
         
         self.envname = envname
         self.env = gym.make(envname)
@@ -81,32 +86,38 @@ class A2C:
         self.data = {"loss": []}
         self.start_time = None
 
-    # Normalize / Standardize the inputs for faster model convergence. 
-    # Randomly generate oberservations and use them to train a scaler. 
-    # Referenced from - Reinforcement Learning Cookbook. 
-    def initialize_scale_state(self):
-        state_space_samples = np.array([self.env.observation_space.sample() for x in range(int(1E4))])
-        self.scaler = sklearn.preprocessing.StandardScaler()
-        self.scaler.fit(state_space_samples)
-
-    def scale_state(self, state):
-        scaled = self.scaler.transform([state])
-        return scaled[0]
+    # # Normalize / Standardize the inputs for faster model convergence.
+    # # Randomly generate oberservations and use them to train a scaler.
+    # # Referenced from - Reinforcement Learning Cookbook.
+    # def initialize_scale_state(self):
+    #     state_space_samples = np.array([self.env.observation_space.sample() for x in range(int(1E4))])
+    #     self.scaler = sklearn.preprocessing.StandardScaler()
+    #     self.scaler.fit(state_space_samples)
+    #
+    # def scale_state(self, state):
+    #     scaled = self.scaler.transform([state])
+    #     return scaled[0]
 
     def select_action(self, state):
-        dist, value = self.model(torch.Tensor(state)) 
-        action = dist.sample().numpy()
-        log_prob = dist.log_prob(action[0])
+        mus, vars, value = self.model(torch.Tensor(state))
+        var = vars.data.cpu().numpy()
+        sig = np.sqrt(var)
+        mu = mus.data.cpu().numpy()
+
+        action = np.random.normal(mu, sig)
+        action = np.clip(action, env.action_space.low, env.action_space.high)
+        log_prob = -np.log(np.sqrt(2*np.pi*sig)) - (action - mu)**2 / (2*sig**2)
+
         return action, log_prob, value
 
-    def update_a2c(self, rewards, log_probs, values, state):
+    def update_a2c(self, rewards, log_probs, values):
 
         Qvals = []
         Qval = 0
-        pw = 0
+        t = 0
         for reward in rewards[::-1]:
-            Qval += GAMMA ** pw * reward
-            pw += 1
+            Qval += GAMMA ** t * reward
+            t += 1
             Qvals.append(Qval)
 
         Qvals = Qvals[::-1]
@@ -151,7 +162,7 @@ class A2C:
                 
                 step_num += 1
 
-                if RENDER_GAME and (e+1) % 25 ==0:
+                if RENDER_GAME and (e+1) % 25 == 0:
                     self.env.render()
 
                 state = self.scale_state(state)
@@ -167,7 +178,7 @@ class A2C:
             total_rewards.append(score)
 
              # Update Actor - Critic 
-            self.update_a2c(rewards, log_probs, values, state)
+            self.update_a2c(rewards, log_probs, values)
 
             if (e+1) % PRINT_DATA == 0:
                 print("Episode: {}, reward: {}, steps: {}".format(e+1, total_rewards[e], step_num))
@@ -236,6 +247,6 @@ class A2C:
                 w.writerow([key, val, "\n"])
 
 if __name__ == "__main__":
-    A2C = A2C(ENVIRONMENT)
+    A2C = A2Ccontinuous(ENVIRONMENT, LR)
     A2C.train()
     # A2C.save_experiment(ENVIRONMENT)
