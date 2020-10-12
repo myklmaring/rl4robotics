@@ -1,22 +1,24 @@
-import sklearn.preprocessing
 import numpy as np
 import random
 import time
 import gym
 
-from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn as nn
 import torch
 
-import sys, time
+import sys
 import argparse
+from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
+
 
 ############################# PARAMETERS #############################
-MAX_EPISODES = 5000
-MAX_STEPS_PER_EP = 300
-FINITE_HORIZONE = 20
+# MAX_EPISODES = 5000
+# MAX_STEPS_PER_EP = 300
+
+MAX_TRAINING_STEPS = 5000
+FINITE_HORIZON = 20
 TEST_FREQUENCY = 10
 TEST_EPISODES = 25
 SAVE_FREQUENCY = 100
@@ -50,11 +52,11 @@ class Plotter():
         self.data = []
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, N_HIDDEN = 10):
         super(ActorCritic, self).__init__()
         self.action_size = action_size
 
-        # Network referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
+        # Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
         self.actor_layer1 = nn.Linear(state_size, N_HIDDEN)
         self.mu = nn.Linear(N_HIDDEN, action_size)
         self.var = nn.Linear(N_HIDDEN, action_size)
@@ -64,10 +66,9 @@ class ActorCritic(nn.Module):
 
 
     def forward(self, x):
-        x = F.relu(self.actor_layer1(x))
-        mu = nn.tanh(self.mu(x))
-        var = nn.softplus(self.var(x)) + 1E-5
-        # distribution = torch.distributions.Normal(mu.view(self.action_size,).data, sigma.view(self.action_size,).data)
+        out = F.relu(self.actor_layer1(x))
+        mu = torch.tanh(self.mu(out))
+        var = F.softplus(self.var(out)) + 1E-5
 
         out = F.relu(self.critic_layer1(x))
         value = self.critic_layer2(out)
@@ -79,30 +80,28 @@ class A2Ccontinuous:
     def __init__(self, envname, LR):
         
         self.envname = envname
-        self.env = gym.make(envname)
+        self.env = [self.make_env(env_name, seed) for seed in range(nproc)]
+        self.env = SubprocVecEnv(self.env)
         self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(device)
         self.optimizer = optim.Adam(self.model.parameters(),LR)
 
         self.data = {"loss": []}
         self.start_time = None
 
-    # # Normalize / Standardize the inputs for faster model convergence.
-    # # Randomly generate oberservations and use them to train a scaler.
-    # # Referenced from - Reinforcement Learning Cookbook.
-    # def initialize_scale_state(self):
-    #     state_space_samples = np.array([self.env.observation_space.sample() for x in range(int(1E4))])
-    #     self.scaler = sklearn.preprocessing.StandardScaler()
-    #     self.scaler.fit(state_space_samples)
-    #
-    # def scale_state(self, state):
-    #     scaled = self.scaler.transform([state])
-    #     return scaled[0]
+    def make_env(self, env_id, seed):
+        def _f():
+            env = gym.make(env_id)
+            env.seed(seed)
+            return env
+        return _f
 
     def select_action(self, state):
-        mus, vars, value = self.model(torch.Tensor(state))
+        mus, vars, value = self.model.forward(torch.tensor(state))
         var = vars.data.cpu().numpy()
-        sig = np.sqrt(var)
-        mu = mus.data.cpu().numpy()
+
+        sig = np.squeeze(np.sqrt(var))
+        mu = np.squeeze(mus.data.cpu().numpy())
+        value = np.squeeze(value.data.cpu().numpy())
 
         action = np.random.normal(mu, sig)
         action = np.clip(action, env.action_space.low, env.action_space.high)
@@ -110,86 +109,106 @@ class A2Ccontinuous:
 
         return action, log_prob, value
 
-    def update_a2c(self, rewards, log_probs, values):
+    def update_a2c(self, rewards, log_probs, values, isdone, state):
 
-        Qvals = []
-        Qval = 0
+        target_vals = []
         t = 0
-        for reward in rewards[::-1]:
-            Qval += GAMMA ** t * reward
-            t += 1
-            Qvals.append(Qval)
 
-        Qvals = Qvals[::-1]
-        Qvals = torch.tensor(Qvals)
-        Qvals = (Qvals - Qvals.mean()) / (Qvals.std() + 1e-5)
+        # Find the estimated value of the final state of the finite horizon
+        _, _, target_val = self.model.forward(torch.tensor(state))
+
+        for reward, done in zip(rewards[::-1], isdone[::-1]):
+            target_val += (1 - done) * GAMMA ** t * target_val + reward
+            t += 1
+            target_vals.append(target_val)
+
+        target_vals = target_vals[::-1]
+        target_vals = torch.tensor(target_vals)
 
         loss = 0
-        for log_prob, value, Qval in zip(log_probs, values, Qvals):
+        for log_prob, value, target_val in zip(log_probs, values, target_vals):
 
-            advantage = Qval - value.item()
+            advantage = target_val - value
             actor_loss = -log_prob * advantage
-            critic_loss = F.smooth_l1_loss(value[0], Qval)
+            critic_loss = F.smooth_l1_loss(value, target_val)
             loss += critic_loss + actor_loss
 
         self.optimizer.zero_grad()
-        loss.min().backward()  
+        loss.backward()
         self.optimizer.step()
 
 
     # Main training loop.
     def train(self):
 
-        score = 0.0
-        total_rewards = []
-        mean_rewards = []
-        std_rewards = []
-        
-        self.initialize_scale_state()
-
-        print("Going to be training for a total of {} episodes".format(MAX_EPISODES))
+        print("Going to be training for a total of {} training steps".format(MAX_TRAINING_STEPS))
         self.start_time = time.time()
-        for e in range(MAX_EPISODES):
-            state = self.env.reset()
-            score = 0.0
-            step_num = 0
+        # for e in range(MAX_EPISODES):
+        #     state = self.env.reset()
+        #     score = 0.0
+        #     step_num = 0
+        #
+        #     rewards = []
+        #     log_probs = []
+        #     values = []
+        #
+        #     for t in range(MAX_STEPS_PER_EP):
+        #
+        #         step_num += 1
+        #
+        #         if RENDER_GAME and (e+1) % 25 == 0:
+        #             self.env.render()
+        #
+        #         state = self.scale_state(state)
+        #         action, log_prob, value = self.select_action(state)
+        #         state, reward, done, _ = self.env.step(action)
+        #         score += reward
+        #         rewards.append(reward)
+        #         values.append(value)
+        #         log_probs.append(log_prob)
+        #         if done:
+        #             break
+        #
+        #     total_rewards.append(score)
+        #
+        #      # Update Actor - Critic
+        #     self.update_a2c(rewards, log_probs, values)
+        #
+        #     if (e+1) % PRINT_DATA == 0:
+        #         print("Episode: {}, reward: {}, steps: {}".format(e+1, total_rewards[e], step_num))
+        #
+        #     if (e+1) % TEST_FREQUENCY == 0:
+        #         print("-"*10 + " testing now " + "-"*10)
+        #         mean_reward, std_reward = self.test(TEST_EPISODES,e)
+        #         print('Mean Reward Achieved : {} \nStandard Deviation : {}'.format(mean_reward, std_reward))
+        #         mean_rewards.append(mean_reward)
+        #         std_rewards.append(std_reward)
+        #         print("-"*50)
+
+        step_num = 0
+        state = self.env.reset()
+
+        for step_num in range(MAX_TRAINING_STEPS):
+            # score = 0.0
 
             rewards = []
             log_probs = []
             values = []
+            isdone = []
 
-            for t in range(MAX_STEPS_PER_EP):
-                
-                step_num += 1
-
-                if RENDER_GAME and (e+1) % 25 == 0:
-                    self.env.render()
-
-                state = self.scale_state(state)
+            for _ in range(FINITE_HORIZON):
+                state = state[:, np.newaxis, :]         # allows for batch processing with the NN
                 action, log_prob, value = self.select_action(state)
                 state, reward, done, _ = self.env.step(action)
-                score += reward
+                # score += reward
+
                 rewards.append(reward)
                 values.append(value)
                 log_probs.append(log_prob)
-                if done:
-                    break
+                isdone.append(done)
 
-            total_rewards.append(score)
-
-             # Update Actor - Critic 
-            self.update_a2c(rewards, log_probs, values)
-
-            if (e+1) % PRINT_DATA == 0:
-                print("Episode: {}, reward: {}, steps: {}".format(e+1, total_rewards[e], step_num))
-
-            if (e+1) % TEST_FREQUENCY == 0:
-                print("-"*10 + " testing now " + "-"*10)
-                mean_reward, std_reward = self.test(TEST_EPISODES,e)
-                print('Mean Reward Achieved : {} \nStandard Deviation : {}'.format(mean_reward, std_reward))
-                mean_rewards.append(mean_reward)
-                std_rewards.append(std_reward)
-                print("-"*50)
+            # Update Actor - Critic
+            self.update_a2c(rewards, log_probs, values, isdone, state)
 
         np.save('experiments/'+ENV+'/'+ENV+'_total_rewards_'+exp_name+'.npy', total_rewards)
         np.save('experiments/'+ENV+'/'+ENV+'_mean_rewards_'+exp_name+'.npy', mean_rewards)
