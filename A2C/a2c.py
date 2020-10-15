@@ -10,6 +10,7 @@ import torch
 
 import sys
 import argparse
+sys.path.insert(1, '/home/michael/Documents/git-repos/baselines')
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 
 
@@ -41,6 +42,7 @@ class ActorCritic(nn.Module):
 
 
     def forward(self, x):
+        x = x.to(device)        # double check that input is put to correct (cpu, gpu)
         out = F.relu(self.actor_layer1(x))
         mu = torch.tanh(self.mu(out))
         var = F.softplus(self.var(out)) + 1E-5
@@ -72,23 +74,20 @@ class A2Ccontinuous:
 
     def select_action(self, state):
         mus, vars, value = self.model.forward(torch.tensor(state))
-        var = vars.data.cpu().numpy()
 
-        sig = np.squeeze(np.sqrt(var))
-        mu = np.squeeze(mus.data.cpu().numpy())
-        value = np.squeeze(value.data.cpu().numpy())
+        sig = torch.squeeze(torch.sqrt(vars))
+        mu = torch.squeeze(mus)
+        value = torch.squeeze(value)
 
-        action = np.random.normal(mu, sig)
-        action = np.clip(action, self.env.action_space.low, self.env.action_space.high)
-
+        action = torch.normal(mu, sig)
+        action = torch.clamp(action, min=self.env.action_space.low[0], max=self.env.action_space.high[0])
 
         # assuming that each action is independent of each other, and that action probability
         #   distribution is normal, we can model the probability using the probability density
         #   function of the n-dimensional multivariate normal distribution
+        log_prob = -torch.log(2*np.pi*torch.prod(sig,1)) - torch.sum((action - mu)**2 / (2*sig**2), 1)
 
-        # log_prob = -np.log(np.sqrt(2*np.pi*sig)) - (action - mu)**2 / (2*sig**2)
-        log_prob = -np.log(2*np.pi*np.prod(sig,axis=1)) \
-                   - np.sum((action - mu)**2 / (2*sig**2), axis=1)
+        action = action.detach().cpu().numpy()
 
         return action, log_prob, value
 
@@ -99,22 +98,22 @@ class A2Ccontinuous:
 
         # Find the estimated value of the final state of the finite horizon
         _, _, target_val = self.model.forward(torch.tensor(state))
-        target_val = np.squeeze(target_val.data.cpu().numpy())
+        target_val = torch.squeeze(target_val)
 
         for reward, done in zip(rewards[::-1], isdone[::-1]):
-            target_val += reward + (1 - done) * GAMMA ** t * target_val
+            target_val += torch.from_numpy(reward).to(device) + torch.from_numpy(1 - done).to(device) \
+                          * GAMMA ** t * target_val
             t += 1
             target_vals.append(target_val)
 
         target_vals = target_vals[::-1]
-        # target_vals = torch.tensor(target_vals)
 
         loss = 0
         for log_prob, value, target_val in zip(log_probs, values, target_vals):
 
             advantage = target_val - value
-            actor_loss = torch.tensor(np.dot(-log_prob, advantage))
-            critic_loss = F.smooth_l1_loss(torch.from_numpy(value), torch.from_numpy(target_val))
+            actor_loss = torch.dot(-log_prob, advantage)
+            critic_loss = F.smooth_l1_loss(value, target_val)
             loss += actor_loss + critic_loss
 
         self.optimizer.zero_grad()
@@ -127,49 +126,7 @@ class A2Ccontinuous:
 
         print("Going to be training for a total of {} training steps".format(MAX_TRAINING_STEPS))
         self.start_time = time.time()
-        # for e in range(MAX_EPISODES):
-        #     state = self.env.reset()
-        #     score = 0.0
-        #     step_num = 0
-        #
-        #     rewards = []
-        #     log_probs = []
-        #     values = []
-        #
-        #     for t in range(MAX_STEPS_PER_EP):
-        #
-        #         step_num += 1
-        #
-        #         if RENDER_GAME and (e+1) % 25 == 0:
-        #             self.env.render()
-        #
-        #         state = self.scale_state(state)
-        #         action, log_prob, value = self.select_action(state)
-        #         state, reward, done, _ = self.env.step(action)
-        #         score += reward
-        #         rewards.append(reward)
-        #         values.append(value)
-        #         log_probs.append(log_prob)
-        #         if done:
-        #             break
-        #
-        #     total_rewards.append(score)
-        #
-        #      # Update Actor - Critic
-        #     self.update_a2c(rewards, log_probs, values)
-        #
-        #     if (e+1) % PRINT_DATA == 0:
-        #         print("Episode: {}, reward: {}, steps: {}".format(e+1, total_rewards[e], step_num))
-        #
-        #     if (e+1) % TEST_FREQUENCY == 0:
-        #         print("-"*10 + " testing now " + "-"*10)
-        #         mean_reward, std_reward = self.test(TEST_EPISODES,e)
-        #         print('Mean Reward Achieved : {} \nStandard Deviation : {}'.format(mean_reward, std_reward))
-        #         mean_rewards.append(mean_reward)
-        #         std_rewards.append(std_reward)
-        #         print("-"*50)
 
-        step_num = 0
         state = self.env.reset()
 
         for step_num in range(MAX_TRAINING_STEPS):
@@ -269,11 +226,8 @@ if __name__ == "__main__":
     print("Using Device: ", device)
 
     # ENVIRONMENT = "MountainCarContinuous-v0"
-    # ENV = 'MountainCar'
     # ENVIRONMENT = "Pendulum-v0"
-    # ENV = 'Pendulum'
     ENVIRONMENT = "LunarLanderContinuous-v2"
-    ENV = 'LunarLander'
     A2C = A2Ccontinuous(ENVIRONMENT, LR)
     A2C.train()
     # A2C.save_experiment(ENVIRONMENT)
