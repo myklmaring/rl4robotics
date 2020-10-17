@@ -2,14 +2,13 @@ import numpy as np
 import random
 import time
 import gym
-
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn as nn
 import torch
-
 import sys
 import argparse
+from tqdm import tqdm
 sys.path.insert(1, '/home/michael/Documents/git-repos/baselines')
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 
@@ -27,43 +26,43 @@ class Plotter():
     def __init__(self):
         self.data = []
 
+    # Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
 class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size, N_HIDDEN = 10):
         super(ActorCritic, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_size = action_size
 
-        # Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
-        self.actor_layer1 = nn.Linear(state_size, N_HIDDEN)
+        self.shared_layer1 = nn.Linear(state_size, N_HIDDEN)
         self.mu = nn.Linear(N_HIDDEN, action_size)
         self.var = nn.Linear(N_HIDDEN, action_size)
 
-        self.critic_layer1 = nn.Linear(state_size, N_HIDDEN)
-        self.critic_layer2 = nn.Linear(N_HIDDEN, 1)
+        self.critic_layer1 = nn.Linear(N_HIDDEN, 1)
 
 
     def forward(self, x):
-        x = x.to(device)        # double check that input is put to correct (cpu, gpu)
-        out = F.relu(self.actor_layer1(x))
+        x = x.to(self.device)        # double check that input is put to correct (cpu, gpu)
+        out = F.relu(self.shared_layer1(x))
         mu = torch.tanh(self.mu(out))
-        var = F.softplus(self.var(out)) + 1E-5
-
-        out = F.relu(self.critic_layer1(x))
-        value = self.critic_layer2(out)
+        var = F.softplus(self.var(out)) + 1E-10
+        value = self.critic_layer1(out)
 
         return mu, var, value
 
 
 class A2Ccontinuous:
-    def __init__(self, envname, LR, nproc = 16):
-        self.nproc = nproc
-        self.envname = envname
-        self.env = [self.make_env(envname, seed) for seed in range(self.nproc)]
+    def __init__(self, parameters):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.parameters = parameters
+        self.envname = self.parameters['ENVIRONMENT']
+        self.env = [self.make_env(self.envname, seed) for seed in range(self.parameters['n_proc'])]
         self.env = SubprocVecEnv(self.env)
-        self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(device)
-        self.optimizer = optim.Adam(self.model.parameters(),LR)
+        self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), self.parameters['LR'])
 
         self.data = {"loss": []}
         self.start_time = None
+        self.end_time = None
 
     def make_env(self, env_id, seed):
         def _f():
@@ -73,11 +72,19 @@ class A2Ccontinuous:
         return _f
 
     def select_action(self, state):
-        mus, vars, value = self.model.forward(torch.tensor(state))
+        """
+        :param
+                    state: numpy array (n_proc x observation_space)
+        :return:
+                    action:     numpy array  (n_proc x action_space) action selected by model for each environment
+                    log_prob:   torch tensor (n_proc x 1) log probability for each action selected
+                    value:      torch tensor (n_proc x 1) value assigned to each state by the model
+        """
 
-        sig = torch.squeeze(torch.sqrt(vars))
-        mu = torch.squeeze(mus)
-        value = torch.squeeze(value)
+        state = state[:, np.newaxis, :]     # allows for batch processing with the NN
+        mu, var, value = self.model.forward(torch.tensor(state))
+        value = torch.squeeze(value, dim=1)
+        sig = torch.sqrt(var)
 
         action = torch.normal(mu, sig)
         action = torch.clamp(action, min=self.env.action_space.low[0], max=self.env.action_space.high[0])
@@ -85,36 +92,57 @@ class A2Ccontinuous:
         # assuming that each action is independent of each other, and that action probability
         #   distribution is normal, we can model the probability using the probability density
         #   function of the n-dimensional multivariate normal distribution
-        log_prob = -torch.log(2*np.pi*torch.prod(sig,1)) - torch.sum((action - mu)**2 / (2*sig**2), 1)
+        log_prob = -torch.log(2*np.pi*torch.prod(sig,2)) - torch.sum((action - mu)**2 / (2*sig**2), 2)
 
+        # This must be numpy to be passed to the openai environments
+        action = torch.squeeze(action)
         action = action.detach().cpu().numpy()
 
         return action, log_prob, value
 
     def update_a2c(self, rewards, log_probs, values, isdone, state):
-
-        target_vals = []
-        t = 0
+        """
+        :param log_probs:   torch tensor (n_proc x FINITE_HORIZON) log probability of each action taken at each time and environment
+        :param values:      torch tensor (n_proc x FINITE_HORIZON) value of each state at each timepoint and environment
+        :param rewards:     list of tensors [n_proc x FINITE_HORIZON] rewards at each timepoint and environment
+        :param isdone:      list of tensors [n_proc x FINITE_HORIZON] boolean values representing if each episode is complete
+        :param state:       numpy array  (n_proc x observation_space)
+        :return:
+        """
 
         # Find the estimated value of the final state of the finite horizon
+        state = state[:, np.newaxis, :]     # allows for batch processing with the NN
         _, _, target_val = self.model.forward(torch.tensor(state))
-        target_val = torch.squeeze(target_val)
+        target_val = torch.squeeze(target_val, dim=2)
+        # print(target_val)
+        target_vals = []
 
         for reward, done in zip(rewards[::-1], isdone[::-1]):
-            target_val += torch.from_numpy(reward).to(device) + torch.from_numpy(1 - done).to(device) \
-                          * GAMMA ** t * target_val
-            t += 1
+            target_val += reward + done * self.parameters['GAMMA'] * target_val
             target_vals.append(target_val)
 
+
         target_vals = target_vals[::-1]
+        target_vals = torch.cat(target_vals, dim=1)
 
-        loss = 0
-        for log_prob, value, target_val in zip(log_probs, values, target_vals):
+        # loss = 0
+        # for log_prob, value, target_val in zip(log_probs, values, target_vals):
+        #     advantage = target_val - value
+        #     actor_loss = torch.dot(-log_prob, advantage)
+        #     critic_loss = F.smooth_l1_loss(value, target_val)
+        #     loss += actor_loss + critic_loss
 
-            advantage = target_val - value
-            actor_loss = torch.dot(-log_prob, advantage)
-            critic_loss = F.smooth_l1_loss(value, target_val)
-            loss += actor_loss + critic_loss
+        advantage = target_vals - values
+        print(rewards[0])
+        # print(target_vals[0])
+        # print(values[0])
+        actor_loss = torch.mean(torch.sum(-log_probs*advantage, 1))
+        critic_loss = F.smooth_l1_loss(values, target_vals)
+        # print(critic_loss.clone().detach().cpu().numpy())
+        # print(actor_loss.clone().detach().cpu().numpy())
+        # entropy = torch.log(torch.sqrt(2*np.pi*sig))
+        loss = actor_loss + critic_loss
+
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -124,12 +152,12 @@ class A2Ccontinuous:
     # Main training loop.
     def train(self):
 
-        print("Going to be training for a total of {} training steps".format(MAX_TRAINING_STEPS))
+        print("Going to be training for a total of {} training steps".format(self.parameters['MAX_TRAINING_STEPS']))
         self.start_time = time.time()
 
         state = self.env.reset()
 
-        for step_num in range(MAX_TRAINING_STEPS):
+        for step_num in tqdm(range(self.parameters['MAX_TRAINING_STEPS'])):
             # score = 0.0
 
             rewards = []
@@ -137,19 +165,25 @@ class A2Ccontinuous:
             values = []
             isdone = []
 
-            for _ in range(FINITE_HORIZON):
-                state = state[:, np.newaxis, :]         # allows for batch processing with the NN
+            for _ in range(self.parameters['FINITE_HORIZON']):
                 action, log_prob, value = self.select_action(state)
                 state, reward, done, _ = self.env.step(action)
                 # score += reward
 
-                rewards.append(reward)
-                values.append(value)
+                reward = torch.unsqueeze(torch.tensor(reward), 1).to(self.device)
+                done = torch.unsqueeze(torch.tensor(done), 1).to(self.device)
+
                 log_probs.append(log_prob)
-                isdone.append(done)
+                values.append(value)
+                rewards.append(reward)
+                isdone.append(torch.logical_not(done))
+
+            # format lists into torch tensors
+            log_probs = torch.cat(log_probs, dim=1).to(self.device)
+            values = torch.cat(values, dim=1).to(self.device)
 
             # Update Actor - Critic
-            self.update_a2c(rewards, log_probs, values, isdone, state[:, np.newaxis, :])
+            self.update_a2c(rewards, log_probs, values, isdone, state)
 
         # np.save('experiments/'+ENV+'/'+ENV+'_total_rewards_'+exp_name+'.npy', total_rewards)
         # np.save('experiments/'+ENV+'/'+ENV+'_mean_rewards_'+exp_name+'.npy', mean_rewards)
@@ -210,24 +244,26 @@ if __name__ == "__main__":
     ############################# PARAMETERS #############################
     # MAX_EPISODES = 5000
     # MAX_STEPS_PER_EP = 300
+    parameters = {}
+    parameters['MAX_TRAINING_STEPS'] = 10
+    parameters['FINITE_HORIZON'] = 20
+    parameters['TEST_FREQUENCY'] = 10
+    parameters['TEST_EPISODES'] = 25
+    parameters['SAVE_FREQUENCY'] = 100
+    parameters['GAMMA'] = 0.9  # discount factor
+    parameters['LR'] = 1E-3  # Learning Rate
+    parameters['N_HIDDEN'] = 20
+    parameters['n_proc'] = 16
+    parameters['PRINT_DATA'] = 1  # how often to print data
+    parameters['RENDER_GAME'] = False  # View the Episode.
+    parameters['ENVIRONMENT'] = "LunarLanderContinuous-v2"
 
-    MAX_TRAINING_STEPS = 100
-    FINITE_HORIZON = 20
-    TEST_FREQUENCY = 10
-    TEST_EPISODES = 25
-    SAVE_FREQUENCY = 100
-    GAMMA = 0.9  # discount factor
-    LR = 1E-3  # Learning Rate
-    N_HIDDEN = 20
-    PRINT_DATA = 1  # how often to print data
-    RENDER_GAME = False  # View the Episode.
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using Device: ", device)
+    print("Using Device: ", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     # ENVIRONMENT = "MountainCarContinuous-v0"
     # ENVIRONMENT = "Pendulum-v0"
-    ENVIRONMENT = "LunarLanderContinuous-v2"
-    A2C = A2Ccontinuous(ENVIRONMENT, LR)
+
+    A2C = A2Ccontinuous(parameters)
     A2C.train()
     # A2C.save_experiment(ENVIRONMENT)
