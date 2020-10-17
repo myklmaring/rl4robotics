@@ -114,35 +114,21 @@ class A2Ccontinuous:
         state = state[:, np.newaxis, :]     # allows for batch processing with the NN
         _, _, target_val = self.model.forward(torch.tensor(state))
         target_val = torch.squeeze(target_val, dim=2)
-        # print(target_val)
         target_vals = []
 
         for reward, done in zip(rewards[::-1], isdone[::-1]):
-            target_val += reward + done * self.parameters['GAMMA'] * target_val
-            target_vals.append(target_val)
 
+            # negative reward because optimization is gradient descent (i.e. lower values are better)
+            target_val += -reward + done * self.parameters['GAMMA'] * target_val
+            target_vals.append(target_val.clone())
 
         target_vals = target_vals[::-1]
         target_vals = torch.cat(target_vals, dim=1)
 
-        # loss = 0
-        # for log_prob, value, target_val in zip(log_probs, values, target_vals):
-        #     advantage = target_val - value
-        #     actor_loss = torch.dot(-log_prob, advantage)
-        #     critic_loss = F.smooth_l1_loss(value, target_val)
-        #     loss += actor_loss + critic_loss
-
         advantage = target_vals - values
-        print(rewards[0])
-        # print(target_vals[0])
-        # print(values[0])
         actor_loss = torch.mean(torch.sum(-log_probs*advantage, 1))
         critic_loss = F.smooth_l1_loss(values, target_vals)
-        # print(critic_loss.clone().detach().cpu().numpy())
-        # print(actor_loss.clone().detach().cpu().numpy())
-        # entropy = torch.log(torch.sqrt(2*np.pi*sig))
         loss = actor_loss + critic_loss
-
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -171,12 +157,12 @@ class A2Ccontinuous:
                 # score += reward
 
                 reward = torch.unsqueeze(torch.tensor(reward), 1).to(self.device)
-                done = torch.unsqueeze(torch.tensor(done), 1).to(self.device)
+                done = torch.unsqueeze(torch.tensor(1-done), 1).to(self.device)
 
                 log_probs.append(log_prob)
                 values.append(value)
                 rewards.append(reward)
-                isdone.append(torch.logical_not(done))
+                isdone.append(done)
 
             # format lists into torch tensors
             log_probs = torch.cat(log_probs, dim=1).to(self.device)
@@ -245,13 +231,14 @@ if __name__ == "__main__":
     # MAX_EPISODES = 5000
     # MAX_STEPS_PER_EP = 300
     parameters = {}
-    parameters['MAX_TRAINING_STEPS'] = 10
+    parameters['MAX_TRAINING_STEPS'] = 1000
     parameters['FINITE_HORIZON'] = 20
     parameters['TEST_FREQUENCY'] = 10
     parameters['TEST_EPISODES'] = 25
     parameters['SAVE_FREQUENCY'] = 100
-    parameters['GAMMA'] = 0.9  # discount factor
-    parameters['LR'] = 1E-3  # Learning Rate
+    parameters['GAMMA'] = 0.5
+    parameters['entrop_c'] = 1e-4
+    parameters['LR'] = 1E-3
     parameters['N_HIDDEN'] = 20
     parameters['n_proc'] = 16
     parameters['PRINT_DATA'] = 1  # how often to print data
