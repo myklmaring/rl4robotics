@@ -9,6 +9,7 @@ import torch
 import sys
 import argparse
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 sys.path.insert(1, '/home/michael/Documents/git-repos/baselines')
 from baselines.common.vec_env.subproc_vec_env import SubprocVecEnv
 
@@ -28,12 +29,13 @@ class Plotter():
 
     # Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
 class ActorCritic(nn.Module):
-    def __init__(self, state_size, action_size, N_HIDDEN = 10):
+    def __init__(self, state_size, action_size, N_HIDDEN = 64):
         super(ActorCritic, self).__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_size = action_size
 
         self.shared_layer1 = nn.Linear(state_size, N_HIDDEN)
+        self.shared_layer2 = nn.Linear(N_HIDDEN, N_HIDDEN)
         self.mu = nn.Linear(N_HIDDEN, action_size)
         self.var = nn.Linear(N_HIDDEN, action_size)
 
@@ -43,8 +45,9 @@ class ActorCritic(nn.Module):
     def forward(self, x):
         x = x.to(self.device)        # double check that input is put to correct (cpu, gpu)
         out = F.relu(self.shared_layer1(x))
+        out = F.relu(self.shared_layer2(out))
         mu = torch.tanh(self.mu(out))
-        var = F.softplus(self.var(out)) + 1E-10
+        var = F.softplus(self.var(out))
         value = self.critic_layer1(out)
 
         return mu, var, value
@@ -55,14 +58,17 @@ class A2Ccontinuous:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.parameters = parameters
         self.envname = self.parameters['ENVIRONMENT']
-        self.env = [self.make_env(self.envname, seed) for seed in range(self.parameters['n_proc'])]
+        self.env = [self.make_env(self.envname, seed) for seed in range(self.parameters['N_PROC'])]
         self.env = SubprocVecEnv(self.env)
-        self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.shape[0]).to(self.device)
+        self.test_env = gym.make(self.envname)
+        self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.shape[0],
+                                 N_HIDDEN=self.parameters['N_HIDDEN']).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), self.parameters['LR'])
 
         self.data = {"loss": []}
         self.start_time = None
         self.end_time = None
+        self.entropy = None
 
     def make_env(self, env_id, seed):
         def _f():
@@ -74,15 +80,15 @@ class A2Ccontinuous:
     def select_action(self, state):
         """
         :param
-                    state: numpy array (n_proc x observation_space)
+                    state: numpy array (N_PROC x observation_space)
         :return:
-                    action:     numpy array  (n_proc x action_space) action selected by model for each environment
-                    log_prob:   torch tensor (n_proc x 1) log probability for each action selected
-                    value:      torch tensor (n_proc x 1) value assigned to each state by the model
+                    action:     numpy array  (N_PROC x action_space) action selected by model for each environment
+                    log_prob:   torch tensor (N_PROC x 1) log probability for each action selected
+                    value:      torch tensor (N_PROC x 1) value assigned to each state by the model
         """
-
+        self.optimizer.zero_grad()
         state = state[:, np.newaxis, :]     # allows for batch processing with the NN
-        mu, var, value = self.model.forward(torch.tensor(state))
+        mu, var, value = self.model(torch.tensor(state).float())
         value = torch.squeeze(value, dim=1)
         sig = torch.sqrt(var)
 
@@ -92,48 +98,55 @@ class A2Ccontinuous:
         # assuming that each action is independent of each other, and that action probability
         #   distribution is normal, we can model the probability using the probability density
         #   function of the n-dimensional multivariate normal distribution
-        log_prob = -torch.log(2*np.pi*torch.prod(sig,2)) - torch.sum((action - mu)**2 / (2*sig**2), 2)
+        log_prob = -0.5 * sig.size(2) * torch.log(torch.tensor(2.0*np.pi)) - torch.sum(torch.log(sig), 2) - \
+                   0.5 * torch.sum(((action-mu)/sig)**2, 2)
+        self.entropy = -torch.mean(torch.sum(torch.log(sig) + 0.5 * torch.log(torch.tensor(2.0 * np.pi * np.e)), 2))
 
         # This must be numpy to be passed to the openai environments
-        action = torch.squeeze(action)
+        action = torch.squeeze(action,1)
         action = action.detach().cpu().numpy()
+
+        # # epsilon-greedy action
+        # if np.random.rand() <= self.parameters['EPSILON']:
+        #     range = self.env.action_space.high[0] - self.env.action_space.low[0]
+        #     action = range * np.random.rand(*action.shape) - range/2
 
         return action, log_prob, value
 
     def update_a2c(self, rewards, log_probs, values, isdone, state):
         """
-        :param log_probs:   torch tensor (n_proc x FINITE_HORIZON) log probability of each action taken at each time and environment
-        :param values:      torch tensor (n_proc x FINITE_HORIZON) value of each state at each timepoint and environment
-        :param rewards:     list of tensors [n_proc x FINITE_HORIZON] rewards at each timepoint and environment
-        :param isdone:      list of tensors [n_proc x FINITE_HORIZON] boolean values representing if each episode is complete
-        :param state:       numpy array  (n_proc x observation_space)
-        :return:
+        :param log_probs:   torch tensor (N_PROC x FINITE_HORIZON) log probability of each action taken at each time and environment
+        :param values:      torch tensor (N_PROC x FINITE_HORIZON) value of each state at each timepoint and environment
+        :param rewards:     list of tensors [N_PROC x FINITE_HORIZON] rewards at each timepoint and environment
+        :param isdone:      list of tensors [N_PROC x FINITE_HORIZON] boolean values representing if each episode is complete
+        :param state:       numpy array  (N_PROC x observation_space)
+        :return: loss:      numpy scalar (scalar) loss used for backpropagation
         """
 
         # Find the estimated value of the final state of the finite horizon
         state = state[:, np.newaxis, :]     # allows for batch processing with the NN
-        _, _, target_val = self.model.forward(torch.tensor(state))
+        _, _, target_val = self.model(torch.tensor(state).float())
         target_val = torch.squeeze(target_val, dim=2)
         target_vals = []
 
         for reward, done in zip(rewards[::-1], isdone[::-1]):
-
-            # negative reward because optimization is gradient descent (i.e. lower values are better)
-            target_val += -reward + done * self.parameters['GAMMA'] * target_val
-            target_vals.append(target_val.clone())
+            target_val = reward + done * self.parameters['GAMMA'] * target_val
+            target_vals.append(target_val)
 
         target_vals = target_vals[::-1]
         target_vals = torch.cat(target_vals, dim=1)
 
         advantage = target_vals - values
-        actor_loss = torch.mean(torch.sum(-log_probs*advantage, 1))
-        critic_loss = F.smooth_l1_loss(values, target_vals)
-        loss = actor_loss + critic_loss
+        actor_loss = -torch.mean(log_probs*advantage)
+        critic_loss = F.mse_loss(target_vals, values)
 
-        self.optimizer.zero_grad()
+        loss = actor_loss + critic_loss + self.parameters['ENTROPY_C'] * self.entropy
+
         loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), 40)
         self.optimizer.step()
 
+        return loss.clone().detach().cpu().numpy()
 
     # Main training loop.
     def train(self):
@@ -142,7 +155,8 @@ class A2Ccontinuous:
         self.start_time = time.time()
 
         state = self.env.reset()
-
+        loss_list = []
+        test_list = []
         for step_num in tqdm(range(self.parameters['MAX_TRAINING_STEPS'])):
             # score = 0.0
 
@@ -154,8 +168,6 @@ class A2Ccontinuous:
             for _ in range(self.parameters['FINITE_HORIZON']):
                 action, log_prob, value = self.select_action(state)
                 state, reward, done, _ = self.env.step(action)
-                # score += reward
-
                 reward = torch.unsqueeze(torch.tensor(reward), 1).to(self.device)
                 done = torch.unsqueeze(torch.tensor(1-done), 1).to(self.device)
 
@@ -169,26 +181,51 @@ class A2Ccontinuous:
             values = torch.cat(values, dim=1).to(self.device)
 
             # Update Actor - Critic
-            self.update_a2c(rewards, log_probs, values, isdone, state)
+            loss = self.update_a2c(rewards, log_probs, values, isdone, state)
+            loss_list.append(loss)
 
-        # np.save('experiments/'+ENV+'/'+ENV+'_total_rewards_'+exp_name+'.npy', total_rewards)
-        # np.save('experiments/'+ENV+'/'+ENV+'_mean_rewards_'+exp_name+'.npy', mean_rewards)
-        # np.save('experiments/'+ENV+'/'+ENV+'_std_rewards_'+exp_name+'.npy', std_rewards)
+            if (step_num % self.parameters['PRINT_DATA']) == 0 and step_num != 0:
+                y = np.array(loss_list)
+                kernel = (1/self.parameters['PRINT_DATA']) * np.ones(self.parameters['PRINT_DATA'])
+                ma_y = np.convolve(y, kernel, mode='same')
+                plt.ticklabel_format(axis='y', style='sci', scilimits=(0,0))
+                plt.plot(y, '-b')
+                plt.plot(ma_y, '-r')
+                plt.axhline(color='k')
+                plt.xlabel("Number of Training Steps")
+                plt.ylabel("Loss")
+                plt.title("Training Loss")
+                plt.legend(['Loss', 'Moving Average (n={})'.format(self.parameters['PRINT_DATA'])])
+                plt.savefig("train_loss.png")
+                plt.close()
+
+            if (step_num % self.parameters['TEST_FREQUENCY']) == 0 and step_num != 0:
+                test_mean, test_std = self.test()
+                test_list.append([test_mean, test_std])
+                x = np.arange(1, step_num, self.parameters['TEST_FREQUENCY'])
+                y = np.array(test_list)
+                plt.errorbar(x,y[:,0],yerr=y[:,1],fmt='.k')
+                plt.axhline(color='k')
+                plt.xlabel("Number of Training Steps")
+                plt.ylabel("Mean Episode Cumulative Reward (n={})".format(self.parameters['TEST_EPISODES']))
+                plt.title("Test Episode Cumulative Reward Progression")
+                plt.savefig("test_reward.png")
+                plt.close()
 
         self.env.close()
  
-    def test(self, num_episodes, train_episode):
+    def test(self):
         testing_rewards = []
-        for e in range(TEST_EPISODES):
-            state = self.env.reset()
-            temp_reward = []
-            for t in range(MAX_STEPS_PER_EP):
-                action, _, _ = self.select_action(state)
-                _, reward, done, _ = self.env.step(action)
-                temp_reward.append(reward)
+        for _ in range(self.parameters['TEST_EPISODES']):
+            state = self.test_env.reset()
+            temp_reward = 0
+            for _ in range(self.parameters['MAX_STEPS_PER_EP']):
+                action, _, _ = self.select_action(state[None, :])
+                _, reward, done, _ = self.test_env.step(np.squeeze(action))
+                temp_reward += reward
                 if done:
                     break
-            testing_rewards.append(sum(temp_reward))
+            testing_rewards.append(temp_reward)
         return np.mean(testing_rewards), np.std(testing_rewards)
 
 
@@ -228,28 +265,30 @@ class A2Ccontinuous:
 
 if __name__ == "__main__":
     ############################# PARAMETERS #############################
-    # MAX_EPISODES = 5000
-    # MAX_STEPS_PER_EP = 300
     parameters = {}
-    parameters['MAX_TRAINING_STEPS'] = 1000
-    parameters['FINITE_HORIZON'] = 20
-    parameters['TEST_FREQUENCY'] = 10
-    parameters['TEST_EPISODES'] = 25
+    parameters['MAX_TRAINING_STEPS'] = 20000
+    parameters['FINITE_HORIZON'] = 5
+    parameters['TEST_FREQUENCY'] = 100
+    parameters['TEST_EPISODES'] = 5
+    parameters['MAX_STEPS_PER_EP'] = 500
     parameters['SAVE_FREQUENCY'] = 100
-    parameters['GAMMA'] = 0.5
-    parameters['entrop_c'] = 1e-4
+    parameters['GAMMA'] = 0.98
+    parameters['ENTROPY_C'] = 1E-3
     parameters['LR'] = 1E-3
-    parameters['N_HIDDEN'] = 20
-    parameters['n_proc'] = 16
-    parameters['PRINT_DATA'] = 1  # how often to print data
+    parameters['N_HIDDEN'] = 64
+    parameters['N_PROC'] = 3
+    parameters['EPSILON'] = 0.05  # e-greedy actions
+    parameters['PRINT_DATA'] = 100  # how often to print data
     parameters['RENDER_GAME'] = False  # View the Episode.
     parameters['ENVIRONMENT'] = "LunarLanderContinuous-v2"
 
 
     print("Using Device: ", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    # ENVIRONMENT = "MountainCarContinuous-v0"
-    # ENVIRONMENT = "Pendulum-v0"
+    # Game Environments
+    # "LunarLanderContinuous-v2"
+    # "MountainCarContinuous-v0"
+    # "Pendulum-v0"
 
     A2C = A2Ccontinuous(parameters)
     A2C.train()
