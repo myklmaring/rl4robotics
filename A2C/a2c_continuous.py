@@ -27,7 +27,7 @@ class Plotter():
     def __init__(self):
         self.data = []
 
-    # Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
+# Network structure referenced from https://towardsdatascience.com/understanding-actor-critic-methods-931b97b6df3f
 class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size, N_HIDDEN = 64):
         super(ActorCritic, self).__init__()
@@ -53,7 +53,7 @@ class ActorCritic(nn.Module):
         return mu, var, value
 
 
-class A2Ccontinuous:
+class A2C:
     def __init__(self, parameters):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.parameters = parameters
@@ -68,7 +68,6 @@ class A2Ccontinuous:
         self.data = {"loss": []}
         self.start_time = None
         self.end_time = None
-        self.entropy = None
 
     def make_env(self, env_id, seed):
         def _f():
@@ -85,65 +84,66 @@ class A2Ccontinuous:
                     action:     numpy array  (N_PROC x action_space) action selected by model for each environment
                     log_prob:   torch tensor (N_PROC x 1) log probability for each action selected
                     value:      torch tensor (N_PROC x 1) value assigned to each state by the model
+                    entropy:    torch scalar () average entropy over all samples
         """
-        self.optimizer.zero_grad()
         state = state[:, np.newaxis, :]     # allows for batch processing with the NN
         mu, var, value = self.model(torch.tensor(state).float())
         value = torch.squeeze(value, dim=1)
-        sig = torch.sqrt(var)
+        print(var)
 
-        action = torch.normal(mu, sig)
+        distribution = torch.distributions.Normal(mu, var.sqrt())
+        action = distribution.sample()
         action = torch.clamp(action, min=self.env.action_space.low[0], max=self.env.action_space.high[0])
-
-        # assuming that each action is independent of each other, and that action probability
-        #   distribution is normal, we can model the probability using the probability density
-        #   function of the n-dimensional multivariate normal distribution
-        log_prob = -0.5 * sig.size(2) * torch.log(torch.tensor(2.0*np.pi)) - torch.sum(torch.log(sig), 2) - \
-                   0.5 * torch.sum(((action-mu)/sig)**2, 2)
-        self.entropy = -torch.mean(torch.sum(torch.log(sig) + 0.5 * torch.log(torch.tensor(2.0 * np.pi * np.e)), 2))
+        log_prob = distribution.log_prob(action).mean(-1)
+        entropy = distribution.entropy().mean().unsqueeze(0)
 
         # This must be numpy to be passed to the openai environments
         action = torch.squeeze(action,1)
         action = action.detach().cpu().numpy()
 
-        # # epsilon-greedy action
-        # if np.random.rand() <= self.parameters['EPSILON']:
-        #     range = self.env.action_space.high[0] - self.env.action_space.low[0]
-        #     action = range * np.random.rand(*action.shape) - range/2
 
-        return action, log_prob, value
+        return action, log_prob, value, entropy
 
-    def update_a2c(self, rewards, log_probs, values, isdone, state):
+    def update_a2c(self, rewards, log_probs, values, isdone, state, entropies):
         """
         :param log_probs:   torch tensor (N_PROC x FINITE_HORIZON) log probability of each action taken at each time and environment
         :param values:      torch tensor (N_PROC x FINITE_HORIZON) value of each state at each timepoint and environment
         :param rewards:     list of tensors [N_PROC x FINITE_HORIZON] rewards at each timepoint and environment
         :param isdone:      list of tensors [N_PROC x FINITE_HORIZON] boolean values representing if each episode is complete
         :param state:       numpy array  (N_PROC x observation_space)
+        :param entropies    torch tensor (N_PROC, )
+
         :return: loss:      numpy scalar (scalar) loss used for backpropagation
         """
 
         # Find the estimated value of the final state of the finite horizon
         state = state[:, np.newaxis, :]     # allows for batch processing with the NN
-        _, _, target_val = self.model(torch.tensor(state).float())
-        target_val = torch.squeeze(target_val, dim=2)
-        target_vals = []
+        _, _, td_target = self.model(torch.tensor(state).float())
+        td_target = torch.squeeze(td_target, dim=2)
+        td_targets = []
 
         for reward, done in zip(rewards[::-1], isdone[::-1]):
-            target_val = reward + done * self.parameters['GAMMA'] * target_val
-            target_vals.append(target_val)
+            td_target = reward + done * self.parameters['GAMMA'] * td_target
+            td_targets.append(td_target)
 
-        target_vals = target_vals[::-1]
-        target_vals = torch.cat(target_vals, dim=1)
+        td_targets = td_targets[::-1]
+        td_targets = torch.cat(td_targets, dim=1)
 
-        advantage = target_vals - values
-        actor_loss = -torch.mean(log_probs*advantage)
-        critic_loss = F.mse_loss(target_vals, values)
+        advantage = td_targets - values
+        actor_loss = -(log_probs*advantage).mean()
+        critic_loss = F.mse_loss(td_targets, values)
+        entropy_loss = self.parameters['ENTROPY_C'] * entropies.mean()
 
-        loss = actor_loss + critic_loss + self.parameters['ENTROPY_C'] * self.entropy
+        print(log_probs)
+        print("actor loss:", actor_loss.clone().detach().cpu().numpy())
+        print("critic loss:", critic_loss.clone().detach().cpu().numpy())
+        print("entropy loss:", entropy_loss.clone().detach().cpu().numpy())
 
+        loss = actor_loss + critic_loss - entropy_loss
+
+        self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), 40)
+        nn.utils.clip_grad_norm_(self.model.parameters(), 5)
         self.optimizer.step()
 
         return loss.clone().detach().cpu().numpy()
@@ -157,16 +157,17 @@ class A2Ccontinuous:
         state = self.env.reset()
         loss_list = []
         test_list = []
+
         for step_num in tqdm(range(self.parameters['MAX_TRAINING_STEPS'])):
-            # score = 0.0
 
             rewards = []
             log_probs = []
             values = []
             isdone = []
+            entropies = []
 
             for _ in range(self.parameters['FINITE_HORIZON']):
-                action, log_prob, value = self.select_action(state)
+                action, log_prob, value, entropy = self.select_action(state)
                 state, reward, done, _ = self.env.step(action)
                 reward = torch.unsqueeze(torch.tensor(reward), 1).to(self.device)
                 done = torch.unsqueeze(torch.tensor(1-done), 1).to(self.device)
@@ -175,13 +176,15 @@ class A2Ccontinuous:
                 values.append(value)
                 rewards.append(reward)
                 isdone.append(done)
+                entropies.append(entropy)
 
             # format lists into torch tensors
             log_probs = torch.cat(log_probs, dim=1).to(self.device)
             values = torch.cat(values, dim=1).to(self.device)
+            entropies = torch.cat(entropies).to(self.device)
 
             # Update Actor - Critic
-            loss = self.update_a2c(rewards, log_probs, values, isdone, state)
+            loss = self.update_a2c(rewards, log_probs, values, isdone, state, entropies)
             loss_list.append(loss)
 
             if (step_num % self.parameters['PRINT_DATA']) == 0 and step_num != 0:
@@ -220,8 +223,8 @@ class A2Ccontinuous:
             state = self.test_env.reset()
             temp_reward = 0
             for _ in range(self.parameters['MAX_STEPS_PER_EP']):
-                action, _, _ = self.select_action(state[None, :])
-                _, reward, done, _ = self.test_env.step(np.squeeze(action))
+                action, _, _, _ = self.select_action(state[None, :])
+                state, reward, done, _ = self.test_env.step(action)
                 temp_reward += reward
                 if done:
                     break
@@ -273,14 +276,14 @@ if __name__ == "__main__":
     parameters['MAX_STEPS_PER_EP'] = 500
     parameters['SAVE_FREQUENCY'] = 100
     parameters['GAMMA'] = 0.98
-    parameters['ENTROPY_C'] = 1E-3
+    parameters['ENTROPY_C'] = 1E-2
     parameters['LR'] = 1E-3
     parameters['N_HIDDEN'] = 64
     parameters['N_PROC'] = 3
     parameters['EPSILON'] = 0.05  # e-greedy actions
     parameters['PRINT_DATA'] = 100  # how often to print data
     parameters['RENDER_GAME'] = False  # View the Episode.
-    parameters['ENVIRONMENT'] = "LunarLanderContinuous-v2"
+    parameters['ENVIRONMENT'] = "MountainCarContinuous-v0"
 
 
     print("Using Device: ", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -290,6 +293,6 @@ if __name__ == "__main__":
     # "MountainCarContinuous-v0"
     # "Pendulum-v0"
 
-    A2C = A2Ccontinuous(parameters)
+    A2C = A2C(parameters)
     A2C.train()
     # A2C.save_experiment(ENVIRONMENT)
