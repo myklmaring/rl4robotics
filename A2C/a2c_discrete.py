@@ -13,125 +13,13 @@ import matplotlib.pyplot as plt
 import torch.multiprocessing as mp
 import ffmpeg
 
-###########################################
-# parser = argparse.ArgumentParser()
-# parser.add_argument('--v', type=str, default='1', help='Experiment Number')
-# opt = parser.parse_args()
-# exp_name = opt.v
-
-
 ######################################################################
-# referenced from MinimalRL and subprocvecenv (openai baselines), with some small original alterations
-# openai baselines as a whole is written using tensorflow
-def worker(envname, worker_id, master_end, worker_end):
-    master_end.close()  # Forbid worker to use the master end for messaging
-    env = gym.make(envname)
-    env.seed(worker_id)
-
-    try:
-        while True:
-            cmd, data = worker_end.recv()
-            if cmd == 'step':
-                ob, reward, done, info = env.step(data)
-                if done:
-                    ob = env.reset()
-                worker_end.send((ob, reward, done, info))
-            elif cmd == 'reset':
-                ob = env.reset()
-                worker_end.send(ob)
-            elif cmd == 'reset_task':
-                ob = env.reset_task()
-                worker_end.send(ob)
-            elif cmd == 'close':
-                worker_end.close()
-                break
-            elif cmd == 'get_spaces':
-                worker_end.send((env.observation_space, env.action_space))
-            elif cmd == 'render':
-                worker_end.send(env.render(mode='rgb_array'))
-            else:
-                raise NotImplementedError
-
-    # Make sure envs close after everything is finished
-    finally:
-        env.close()
-
-# referenced from MinimalRL and subprocvecenv (openai baselines), with some small original alterations
-# openai baselines as a whole is written using tensorflow
-class ParallelEnv:
-    def __init__(self, n_train_processes, env_name):
-        self.nenvs = n_train_processes
-        self.waiting = False
-        self.closed = False
-        self.workers = list()
-        self.env_name = env_name
-
-        master_ends, worker_ends = zip(*[mp.Pipe() for _ in range(self.nenvs)])
-        self.master_ends, self.worker_ends = master_ends, worker_ends
-
-        for worker_id, (master_end, worker_end) in enumerate(zip(master_ends, worker_ends)):
-            p = mp.Process(target=worker,
-                           args=(self.env_name, worker_id, master_end, worker_end))
-            p.daemon = True
-            p.start()
-            self.workers.append(p)
-
-        # Forbid master to use the worker end for messaging
-        for worker_end in worker_ends:
-            worker_end.close()
-
-        self.master_ends[0].send(('get_spaces', None))
-        self.observation_space, self.action_space = self.master_ends[0].recv()
-
-    def step_async(self, actions):
-        for master_end, action in zip(self.master_ends, actions):
-            master_end.send(('step', action))
-        self.waiting = True
-
-    def step_wait(self):
-        results = [master_end.recv() for master_end in self.master_ends]
-        self.waiting = False
-        obs, rews, dones, infos = zip(*results)
-        return np.stack(obs), np.stack(rews), np.stack(dones), infos
-
-    def reset(self):
-        for master_end in self.master_ends:
-            master_end.send(('reset', None))
-        return np.stack([master_end.recv() for master_end in self.master_ends])
-
-    def step(self, actions):
-        self.step_async(actions)
-        return self.step_wait()
-
-    def get_images(self):
-        if not self.closed:
-            for master_end in self.master_ends:
-                master_end(('render', None))
-            imgs = [master_end.recv() for master_end in master_ends]
-
-    # Close processes
-    def close(self):
-        if self.closed:
-            return
-        if self.waiting:
-            [master_end.recv() for master_end in self.master_ends]
-        for master_end in self.master_ends:
-            master_end.send(('close', None))
-        for worker in self.workers:
-            worker.join()
-            self.closed = True
-
-    # destructor method for cleanup
-    def __del__(self):
-        if not self.closed:
-            self.close()
-
-
 class ActorCritic(nn.Module):
     def __init__(self, state_size, action_size, N_HIDDEN=64):
         super(ActorCritic, self).__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_size = action_size
+        self.state_size = state_size
 
         self.shared_layer1 = nn.Linear(state_size, N_HIDDEN)
         self.shared_layer2 = nn.Linear(N_HIDDEN, N_HIDDEN)
@@ -154,17 +42,20 @@ class A2C:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.parameters = parameters
         self.envname = self.parameters['ENVIRONMENT']
-        self.env = ParallelEnv(self.parameters['N_PROC'], self.envname)
+        self.env = gym.vector.make(self.envname, num_envs=self.parameters['N_PROC'])
 
-        # observation space is Box(x,y,z) i.e. continuous, but action space is Discrete(n) i.e. discrete
-        # Shape method of Discrete(n) returned ()
-        self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.n,
+        # observation space is Box(x,y,z) i.e. continuous
+        # Shape method of Discrete(n) returned (), n method returns n from Discrete(n)
+        # for vectorized environment, env.observation_space returns (n_proc, observation_space)
+        #                             env.action space is Tuple(Discrete(n), Discrete(n), ..., Discrete(n))
+
+        self.model = ActorCritic(self.env.observation_space.shape[1], self.env.action_space[0].n,
             N_HIDDEN=self.parameters['N_HIDDEN']).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.parameters['LR'])
         self.start_time = None
         self.end_time = None
         self.best_network = None
-
+        self.best_testmean = -np.inf
 
     def select_action(self, state, model):
         """
@@ -242,7 +133,6 @@ class A2C:
 
         state = self.env.reset()
         loss_list, test_list = [], []
-        best_testmean = -np.inf
 
         for step_num in tqdm(range(self.parameters['MAX_TRAINING_STEPS'])):
 
@@ -257,9 +147,10 @@ class A2C:
 
                 log_probs.append(log_prob)
                 values.append(value)
+                entropies.append(entropy)
+
                 rewards.append(reward)
                 isdone.append(done)
-                entropies.append(entropy)
 
             # format lists into torch tensors
             log_probs = torch.cat(log_probs, dim=1).to(self.device)
@@ -299,8 +190,9 @@ class A2C:
                 plt.close()
 
                 # save the network from the game with the best test mean reward
-                if test_mean > best_testmean:
+                if test_mean > self.best_testmean:
                     self.best_network = self.model
+                    self.best_testmean = test_mean
 
         self.env.close()
 
@@ -332,7 +224,8 @@ class A2C:
             state, reward, done, _ = env.step(action[0])
             total_reward += reward
 
-        self.vidwrite('/home/michael/Documents/git-repos/rl4robotics/A2C/movie.mp4', images)
+        file = '/home/michael/Documents/git-repos/rl4robotics/A2C/movie.mp4'
+        self.vidwrite(file, images)
         env.close()
 
     # referenced from Kyle Mcdonald on https://github.com/kkroening/ffmpeg-python/issues/246
@@ -388,7 +281,7 @@ class A2C:
 if __name__ == "__main__":
     ############################# PARAMETERS #############################
     parameters = {}
-    parameters['MAX_TRAINING_STEPS'] = 1000
+    parameters['MAX_TRAINING_STEPS'] = 10000
     parameters['FINITE_HORIZON'] = 5
     parameters['N_PROC'] = 3
     parameters['PRINT_DATA'] = 500  # how often to print data
@@ -400,8 +293,6 @@ if __name__ == "__main__":
     parameters['ENTROPY_C'] = 0
     parameters['LR'] = 1E-3
     parameters['N_HIDDEN'] = 64
-    parameters['EPSILON'] = 0.05  # e-greedy actions
-    parameters['RENDER_GAME'] = False  # View the Episode.
     parameters['ENVIRONMENT'] = "CartPole-v1"
 
     print("Using Device: ", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
